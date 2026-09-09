@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from ultralytics.utils import LOGGER, ROCM_EXTRA_INDEX
+from ultralytics.utils import LOGGER, ROCM_EXTRA_INDEX, USER_CONFIG_DIR
 from ultralytics.utils.checks import check_requirements, rocm_is_available
 
 from .base import BaseBackend
@@ -85,7 +86,21 @@ class ONNXBackend(BaseBackend):
             # Select execution provider
             available = onnxruntime.get_available_providers()
             if cuda and "MIGraphXExecutionProvider" in available:
-                providers = [("MIGraphXExecutionProvider", {"device_id": self.device.index}), "CPUExecutionProvider"]
+                # The MIGraphX EP JIT-compiles the graph on every session init (~32s for YOLO11n at 640 on
+                # gfx1151, ~9 CPU-minutes of parallel compile). The EP can cache the compiled program, but
+                # only when told where: either the ORT_MIGRAPHX_MODEL_CACHE_PATH env var or the
+                # migraphx_model_cache_dir provider option. Neither is on by default, so enable it here with
+                # a sane location while honoring an explicit user setting. Cache keys lead with the packed
+                # MIGraphX version (2.15.0 -> 0x20f00), so a runtime upgrade invalidates rather than reuses.
+                mgx_options = {"device_id": self.device.index}
+                cache_dir = os.getenv("ORT_MIGRAPHX_MODEL_CACHE_PATH") or os.getenv("MIGRAPHX_MODEL_CACHE_DIR")
+                cache_dir = Path(cache_dir) if cache_dir else USER_CONFIG_DIR / "migraphx_cache"
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    mgx_options["migraphx_model_cache_dir"] = str(cache_dir)
+                except OSError as e:  # read-only or unwritable location, e.g. a locked-down container
+                    LOGGER.warning(f"MIGraphX compiled-model cache disabled ({cache_dir}): {e}")
+                providers = [("MIGraphXExecutionProvider", mgx_options), "CPUExecutionProvider"]
             elif cuda and "CUDAExecutionProvider" in available:
                 providers = [("CUDAExecutionProvider", {"device_id": self.device.index}), "CPUExecutionProvider"]
             elif self.device.type == "mps" and "CoreMLExecutionProvider" in available:
